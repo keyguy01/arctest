@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import pandas as pd
-
 from datetime import datetime
 
-RUN_DATE = datetime.now().strftime(
-    "%Y-%m-%d"
-)
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+RUN_DATE = datetime.now().strftime("%Y-%m-%d")
 
 ARC_DIR = os.path.join(
     "reports",
@@ -24,9 +22,9 @@ os.makedirs(
     exist_ok=True
 )
 
-# --------------------------------------------------
-# Priority Ranking
-# --------------------------------------------------
+# ============================================================
+# PRIORITY RANKING
+# ============================================================
 
 PRIORITY_RANK = {
     "CRITICAL": 1,
@@ -35,23 +33,552 @@ PRIORITY_RANK = {
     "LOW": 4
 }
 
-# --------------------------------------------------
-# Discover Risk Reports
-# --------------------------------------------------
+# ============================================================
+# NOISE PATTERNS
+# ============================================================
 
-risk_reports = [
+NOISE_PATTERNS = [
 
-    file
+    # Tests
+    "/test/",
+    "/tests/",
+    "\\test\\",
+    "\\tests\\",
 
-    for file in os.listdir(
-        ARC_DIR
-    )
+    "/spec/",
+    "/specs/",
+    "\\spec\\",
+    "\\specs\\",
 
-    if file.endswith(
-        "-risk-report.csv"
-    )
+    ".test.",
+    ".spec.",
 
+    # Build output
+    "/obj/",
+    "\\obj\\",
+
+    "/bin/",
+    "\\bin\\",
+
+    "/package/",
+    "\\package\\",
+
+    "/tempbuilddir/",
+    "\\tempbuilddir\\",
+
+    # Dependencies
+    "/dependencies/",
+    "\\dependencies\\",
+
+    "/packages/",
+    "\\packages\\",
+
+    "node_modules",
+
+    "/vendor/",
+    "\\vendor\\",
+
+    # WordPress plugins
+    "/wp-content/plugins/",
+    "\\wp-content\\plugins\\",
+
+    "/wordfence/",
+    "\\wordfence\\",
+
+    "/duplicator/",
+    "\\duplicator\\",
+
+    # Coverage
+    "/coverage/",
+    "\\coverage\\"
 ]
+
+# ============================================================
+# RAPID7 LOW-VALUE FINDINGS
+# ============================================================
+
+LOW_VALUE_R7 = {
+    "BROWSERCACHECHECK01",
+    "XCONTENTTYPEATTACK_1",
+    "XFRAMEATTACK_1",
+    "HSTSATTACK_4"
+}
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_string(value):
+    """
+    Safely convert a CSV value to a clean string.
+    """
+
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def normalize_priority(value):
+    """
+    Normalize priority values.
+    """
+
+    value = clean_string(value).upper()
+
+    if value in PRIORITY_RANK:
+        return value
+
+    return "LOW"
+
+
+def normalize_source(value):
+    """
+    Normalize security scanner source.
+    """
+
+    value = clean_string(value).upper()
+
+    if value in {"RAPID7", "INSIGHTVM", "R7"}:
+        return "RAPID7"
+
+    if value == "SNYK":
+        return "SNYK"
+
+    return value
+
+
+def is_noise(path):
+    """
+    Determine whether a file path represents
+    test/build/dependency noise.
+    """
+
+    path = clean_string(path)
+
+    if not path:
+        return False
+
+    path = path.lower()
+
+    return any(
+        pattern in path
+        for pattern in NOISE_PATTERNS
+    )
+
+
+def safe_column(df, column, default=""):
+    """
+    Return a column if it exists, otherwise create
+    a safe default Series.
+    """
+
+    if column in df.columns:
+        return df[column]
+
+    return pd.Series(
+        [default] * len(df),
+        index=df.index
+    )
+
+
+def first_nonempty(series):
+    """
+    Return the first meaningful value from a Series.
+    """
+
+    for value in series:
+
+        value = clean_string(value)
+
+        if value:
+            return value
+
+    return ""
+
+
+def unique_values(series):
+    """
+    Return sorted unique non-empty values.
+    """
+
+    values = set()
+
+    for value in series:
+
+        value = clean_string(value)
+
+        if value:
+            values.add(value)
+
+    return sorted(values)
+
+
+def extract_source(row):
+    """
+    Determine source safely.
+
+    Newer risk reports should contain SOURCE, but this
+    function prevents the script from crashing if SOURCE
+    is missing.
+
+    If SOURCE is unavailable, we infer Snyk when Snyk-specific
+    fields exist and Rapid7 when Rapid7-specific fields exist.
+    """
+
+    source = clean_string(
+        row.get("SOURCE", "")
+    )
+
+    if source:
+        return normalize_source(source)
+
+    # Snyk-specific fields
+    snyk_fields = [
+        "ISSUE_ID",
+        "RULE_KEY",
+        "RISK_SCORE",
+        "START_LINE",
+        "START_COLUMN",
+        "END_LINE",
+        "END_COLUMN"
+    ]
+
+    for field in snyk_fields:
+
+        value = clean_string(
+            row.get(field, "")
+        )
+
+        if value:
+            return "SNYK"
+
+    # Rapid7-specific fields
+    rapid7_fields = [
+        "APP_UUID",
+        "VULNERABILITY_UUID",
+        "VULNERABILITY_SCORE",
+        "MODULE_NAME",
+        "ATTACK_TYPE",
+        "ROOTCAUSE_URL",
+        "ROOTCAUSE_METHOD",
+        "SCAN_UUID",
+        "SCAN_TYPE",
+        "VECTOR_STRING",
+        "INSIGHT_URL",
+        "PROOF",
+        "PROOF_DESCRIPTION"
+    ]
+
+    for field in rapid7_fields:
+
+        value = clean_string(
+            row.get(field, "")
+        )
+
+        if value:
+            return "RAPID7"
+
+    return "UNKNOWN"
+
+
+def get_title(row):
+    """
+    Get the best available finding title.
+
+    Supports both the older normalized risk-report
+    structure and the newer scanner CSV structure.
+    """
+
+    candidates = [
+        "TITLE",
+        "NORMALIZED_TITLE",
+        "RULE_KEY",
+        "ATTACK_TYPE",
+        "MODULE_NAME"
+    ]
+
+    for column in candidates:
+
+        value = clean_string(
+            row.get(column, "")
+        )
+
+        if value:
+            return value
+
+    return "Security Finding"
+
+
+def get_cwe(row):
+    """
+    Get CWE from either scanner.
+    """
+
+    return clean_string(
+        row.get("CWE", "")
+    )
+
+
+def get_file_path(row):
+    """
+    Get file path from the available CSV structure.
+    """
+
+    return clean_string(
+        row.get("FILE_PATH", "")
+    )
+
+
+def get_url(row):
+    """
+    Get URL from either scanner structure.
+    """
+
+    candidates = [
+        "URL",
+        "ROOTCAUSE_URL",
+        "INSIGHT_URL"
+    ]
+
+    for column in candidates:
+
+        value = clean_string(
+            row.get(column, "")
+        )
+
+        if value:
+            return value
+
+    return ""
+
+
+def get_occurrence_count(row):
+    """
+    Safely calculate occurrence count.
+
+    Uses OCCURRENCES when available.
+
+    Otherwise defaults to 1 because each row represents
+    one finding.
+    """
+
+    value = row.get(
+        "OCCURRENCES",
+        1
+    )
+
+    try:
+
+        if pd.isna(value):
+            return 1
+
+        return max(
+            int(float(value)),
+            1
+        )
+
+    except (
+        ValueError,
+        TypeError
+    ):
+
+        return 1
+
+
+def get_file_count(row):
+    """
+    Safely determine affected file count.
+    """
+
+    value = row.get(
+        "FILE_COUNT",
+        None
+    )
+
+    if value is not None:
+
+        try:
+
+            if not pd.isna(value):
+                return max(
+                    int(float(value)),
+                    0
+                )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    file_path = get_file_path(row)
+
+    return 1 if file_path else 0
+
+
+def get_url_count(row):
+    """
+    Safely determine affected URL count.
+    """
+
+    value = row.get(
+        "URL_COUNT",
+        None
+    )
+
+    if value is not None:
+
+        try:
+
+            if not pd.isna(value):
+                return max(
+                    int(float(value)),
+                    0
+                )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    url = get_url(row)
+
+    return 1 if url else 0
+
+
+def remediation_scope(file_count):
+    """
+    Determine remediation size.
+    """
+
+    if file_count > 50:
+        return "Large"
+
+    if file_count > 15:
+        return "Medium"
+
+    return "Small"
+
+
+def calculate_risk_score(row):
+    """
+    Calculate a prioritization score.
+
+    Priority provides the largest contribution.
+    Occurrence count, affected files, source and scope
+    provide additional context.
+    """
+
+    priority = normalize_priority(
+        row.get("PRIORITY", "LOW")
+    )
+
+    base_scores = {
+        "CRITICAL": 100,
+        "HIGH": 75,
+        "MEDIUM": 50,
+        "LOW": 25
+    }
+
+    score = base_scores.get(
+        priority,
+        25
+    )
+
+    occurrences = get_occurrence_count(
+        row
+    )
+
+    file_count = get_file_count(
+        row
+    )
+
+    source = extract_source(
+        row
+    )
+
+    # Finding prevalence
+    score += min(
+        occurrences,
+        50
+    )
+
+    # Code impact
+    score += min(
+        file_count * 2,
+        30
+    )
+
+    # Snyk code findings receive additional weight
+    if source == "SNYK":
+        score += 25
+
+    # Rapid7 runtime findings receive slightly less
+    # weight than source-code findings when otherwise equal
+    elif source == "RAPID7":
+        score += 10
+
+    # Large remediation scope deserves additional attention
+    if file_count > 50:
+        score += 20
+
+    elif file_count > 15:
+        score += 10
+
+    return score
+
+
+def group_key(row):
+    """
+    Build a stable grouping key.
+
+    Group by application, source, title and CWE.
+
+    This prevents duplicate findings from producing
+    dozens of nearly identical remediation records.
+    """
+
+    app_name = clean_string(
+        row.get("APP_NAME", "")
+    )
+
+    source = extract_source(
+        row
+    )
+
+    title = get_title(
+        row
+    )
+
+    cwe = get_cwe(
+        row
+    )
+
+    return (
+        app_name,
+        source,
+        title,
+        cwe
+    )
+
+
+# ============================================================
+# DISCOVER RISK REPORTS
+# ============================================================
+
+risk_reports = sorted(
+    [
+        file
+        for file in os.listdir(
+            ARC_DIR
+        )
+        if file.endswith(
+            "-risk-report.csv"
+        )
+    ]
+)
 
 if not risk_reports:
 
@@ -61,20 +588,33 @@ if not risk_reports:
 
     raise SystemExit(0)
 
-# --------------------------------------------------
-# Process Each Report
-# --------------------------------------------------
+
+# ============================================================
+# REPORT DISCOVERY
+# ============================================================
 
 print()
-print("=" * 60)
-print(f"ARC_DIR: {ARC_DIR}")
-print(f"Risk Reports Found: {len(risk_reports)}")
+print("=" * 70)
+print(
+    f"ARC_DIR: {ARC_DIR}"
+)
+print(
+    f"Risk Reports Found: {len(risk_reports)}"
+)
 
 for file in risk_reports:
-    print(f"  {file}")
 
-print("=" * 60)
+    print(
+        f"  {file}"
+    )
+
+print("=" * 70)
 print()
+
+
+# ============================================================
+# PROCESS EACH APPLICATION
+# ============================================================
 
 for report_file in risk_reports:
 
@@ -83,41 +623,49 @@ for report_file in risk_reports:
         report_file
     )
 
-    app_name = (
-        report_file
-        .replace(
-            "-risk-report.csv",
-            ""
-        )
+    APP_NAME = report_file.replace(
+        "-risk-report.csv",
+        ""
     )
 
     OUTPUT_FILE = os.path.join(
         ARC_DIR,
-        f"{app_name}-prioritized-findings.csv"
+        f"{APP_NAME}-prioritized-findings.csv"
     )
 
     print()
-    print("=" * 60)
+    print("=" * 70)
+
     print(
         f"Processing: {report_file}"
     )
-
-    # --------------------------------------------------
-    # Load Data
-    # --------------------------------------------------
 
     print(
         f"Loading {INPUT_FILE}"
     )
 
-    df = pd.read_csv(
-        INPUT_FILE
-    )
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
+
+    try:
+
+        df = pd.read_csv(
+            INPUT_FILE
+        )
+
+    except Exception as exc:
+
+        print(
+            f"ERROR loading {INPUT_FILE}: {exc}"
+        )
+
+        continue
 
     if df.empty:
 
         print(
-            f"{app_name}: No findings found."
+            f"{APP_NAME}: No findings found."
         )
 
         continue
@@ -126,83 +674,124 @@ for report_file in risk_reports:
         f"Loaded {len(df)} findings"
     )
 
-    # --------------------------------------------------
-    # Noise Filtering
-    # --------------------------------------------------
+    print(
+        "Columns detected:"
+    )
 
-    NOISE_PATTERNS = [
+    print(
+        ", ".join(df.columns)
+    )
 
-        # tests
-        "/test/",
-        "/tests/",
-        "\\test\\",
-        "\\tests\\",
+    # --------------------------------------------------------
+    # NORMALIZE REQUIRED FIELDS
+    # --------------------------------------------------------
 
-        "/spec/",
-        "/specs/",
-        "\\spec\\",
-        "\\specs\\",
+    if "APP_NAME" not in df.columns:
 
-        ".test.",
-        ".spec.",
+        df["APP_NAME"] = APP_NAME
 
-        # build output
-        "/obj/",
-        "\\obj\\",
+    else:
 
-        "/bin/",
-        "\\bin\\",
-
-        "/package/",
-        "\\package\\",
-
-        "/tempbuilddir/",
-        "\\tempbuilddir\\",
-
-        # dependencies
-        "/dependencies/",
-        "\\dependencies\\",
-
-        "/packages/",
-        "\\packages\\",
-
-        "node_modules",
-
-        "/vendor/",
-        "\\vendor\\",
-
-        # wordpress plugins
-        "/wp-content/plugins/",
-        "\\wp-content\\plugins\\",
-
-        "/wordfence/",
-        "/duplicator/",
-
-        # coverage
-        "/coverage/",
-        "\\coverage\\"
-    ]
-
-    def is_noise(path):
-
-        if pd.isna(path):
-            return False
-
-        path = str(path).lower()
-
-        return any(
-            pattern in path
-            for pattern in NOISE_PATTERNS
+        df["APP_NAME"] = (
+            df["APP_NAME"]
+            .fillna(APP_NAME)
+            .astype(str)
         )
+
+    if "PRIORITY" not in df.columns:
+
+        print(
+            "WARNING: PRIORITY column missing. "
+            "Defaulting findings to LOW."
+        )
+
+        df["PRIORITY"] = "LOW"
+
+    else:
+
+        df["PRIORITY"] = (
+            df["PRIORITY"]
+            .apply(normalize_priority)
+        )
+
+    if "SOURCE" not in df.columns:
+
+        print(
+            "WARNING: SOURCE column missing. "
+            "Source will be inferred from scanner-specific fields."
+        )
+
+        df["SOURCE"] = df.apply(
+            extract_source,
+            axis=1
+        )
+
+    else:
+
+        df["SOURCE"] = (
+            df["SOURCE"]
+            .apply(normalize_source)
+        )
+
+    if "TITLE" not in df.columns:
+
+        print(
+            "WARNING: TITLE column missing. "
+            "Finding titles will be inferred."
+        )
+
+        df["TITLE"] = df.apply(
+            get_title,
+            axis=1
+        )
+
+    if "CWE" not in df.columns:
+
+        df["CWE"] = ""
+
+    if "FILE_PATH" not in df.columns:
+
+        df["FILE_PATH"] = ""
+
+    if "URL" not in df.columns:
+
+        df["URL"] = ""
+
+    if "DESCRIPTION" not in df.columns:
+
+        df["DESCRIPTION"] = ""
+
+    if "ACTION" not in df.columns:
+
+        df["ACTION"] = ""
+
+    if "VALIDATION" not in df.columns:
+
+        df["VALIDATION"] = ""
+
+    if "RECOMMENDED_ACTION" not in df.columns:
+
+        df["RECOMMENDED_ACTION"] = df[
+            "ACTION"
+        ]
+
+    if "OCCURRENCES" not in df.columns:
+
+        df["OCCURRENCES"] = 1
+
+    # --------------------------------------------------------
+    # NOISE FILTERING
+    # --------------------------------------------------------
 
     before_count = len(df)
 
     if "FILE_PATH" in df.columns:
 
         df = df[
-            ~df["FILE_PATH"]
-            .apply(is_noise)
-        ]
+            ~df["FILE_PATH"].apply(
+                is_noise
+            )
+        ].copy()
 
     after_count = len(df)
 
@@ -211,152 +800,207 @@ for report_file in risk_reports:
         f"{before_count - after_count}"
     )
 
-    # --------------------------------------------------
-    # Filter Low Value Rapid7 Findings
-    # --------------------------------------------------
+    if df.empty:
 
-    LOW_VALUE_R7 = [
-
-        "BROWSERCACHECHECK01",
-        "XContentTypeAttack_1",
-        "XFrameAttack_1",
-        "HSTSAttack_4"
-
-    ]
-
-    # --------------------------------------------------
-# Filter Low Value Rapid7 Findings
-# --------------------------------------------------
-
-    LOW_VALUE_R7 = {
-        "BROWSERCACHECHECK01",
-        "XContentTypeAttack_1",
-        "XFrameAttack_1",
-        "HSTSAttack_4",
-    }
-    
-    # Normalize SOURCE and TITLE safely
-    if "SOURCE" not in df.columns:
         print(
-            "WARNING: SOURCE column missing. "
-            "Skipping Rapid7-specific low-value filtering."
+            f"{APP_NAME}: "
+            "All findings were filtered as noise."
         )
-        df["SOURCE"] = ""
-    
-    if "TITLE" not in df.columns:
-        print(
-            "ERROR: TITLE column missing. "
-            "Cannot perform finding prioritization."
-        )
+
         continue
-    
-    df["SOURCE"] = (
-        df["SOURCE"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .str.upper()
-    )
-    
-    df["TITLE"] = (
-        df["TITLE"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-    
-    r7_low = (
-        df["SOURCE"].eq("RAPID7")
-        &
-        df["TITLE"].isin(LOW_VALUE_R7)
-    )
-    
-    removed_r7 = int(r7_low.sum())
-    
-    df = df.loc[~r7_low].copy()
-    
+
+    # --------------------------------------------------------
+    # RAPID7 LOW-VALUE FILTERING
+    # --------------------------------------------------------
+
+    def is_low_value_r7(row):
+
+        source = normalize_source(
+            row.get("SOURCE", "")
+        )
+
+        title = clean_string(
+            row.get("TITLE", "")
+        ).upper()
+
+        return (
+            source == "RAPID7"
+            and
+            title in LOW_VALUE_R7
+        )
+
+    before_r7 = len(df)
+
+    df = df[
+        ~df.apply(
+            is_low_value_r7,
+            axis=1
+        )
+    ].copy()
+
     print(
         f"Filtered Low-Value Rapid7 Findings: "
-        f"{removed_r7}"
+        f"{before_r7 - len(df)}"
     )
 
+    if df.empty:
 
-    print(
-        f"Remaining Findings: "
-        f"{len(df)}"
-    )
+        print(
+            f"{APP_NAME}: "
+            "No findings remain after filtering."
+        )
 
-    # --------------------------------------------------
-    # Group Findings
-    # --------------------------------------------------
+        continue
+
+    # ========================================================
+    # GROUP FINDINGS
+    # ========================================================
 
     grouped = []
 
-    group_columns = [
+    grouped_rows = {}
 
-        "APP_NAME",
-        "SOURCE",
-        "TITLE",
-        "CWE"
+    for _, row in df.iterrows():
 
-    ]
-
-    for keys, group in df.groupby(
-        group_columns,
-        dropna=False
-    ):
-
-        app_name_group, source, title, cwe = keys
-
-        priorities = (
-            group["PRIORITY"]
-            .fillna("LOW")
-            .astype(str)
-            .str.upper()
+        key = group_key(
+            row
         )
+
+        if key not in grouped_rows:
+
+            grouped_rows[key] = []
+
+        grouped_rows[key].append(
+            row
+        )
+
+    print(
+        f"Unique Finding Groups: "
+        f"{len(grouped_rows)}"
+    )
+
+    # --------------------------------------------------------
+    # PROCESS GROUPS
+    # --------------------------------------------------------
+
+    for key, rows in grouped_rows.items():
+
+        group = pd.DataFrame(
+            rows
+        )
+
+        app_name_group = clean_string(
+            group.iloc[0].get(
+                "APP_NAME",
+                APP_NAME
+            )
+        )
+
+        source = clean_string(
+            group.iloc[0].get(
+                "SOURCE",
+                ""
+            )
+        )
+
+        title = clean_string(
+            group.iloc[0].get(
+                "TITLE",
+                "Security Finding"
+            )
+        )
+
+        cwe = clean_string(
+            group.iloc[0].get(
+                "CWE",
+                ""
+            )
+        )
+
+        # ----------------------------------------------------
+        # PRIORITY
+        # ----------------------------------------------------
+
+        priorities = [
+            normalize_priority(value)
+            for value in group[
+                "PRIORITY"
+            ]
+        ]
 
         highest_priority = min(
             priorities,
-            key=lambda x: PRIORITY_RANK.get(
-                x,
-                99
-            )
+            key=lambda value:
+                PRIORITY_RANK.get(
+                    value,
+                    99
+                )
         )
 
-        file_paths = sorted(
-            set(
-                str(x)
-                for x in group[
-                    "FILE_PATH"
-                ].dropna()
-                if str(x).strip()
-            )
+        # ----------------------------------------------------
+        # FILES
+        # ----------------------------------------------------
+
+        file_paths = unique_values(
+            group["FILE_PATH"]
         )
 
-        urls = sorted(
-            set(
-                str(x)
-                for x in group[
-                    "URL"
-                ].dropna()
-                if str(x).strip()
-            )
+        # ----------------------------------------------------
+        # URLS
+        # ----------------------------------------------------
+
+        urls = unique_values(
+            group["URL"]
         )
 
-        # ----------------------------------------------
-        # Directory Analysis
-        # ----------------------------------------------
+        # ----------------------------------------------------
+        # OCCURRENCES
+        # ----------------------------------------------------
+
+        occurrence_total = 0
+
+        for value in group[
+            "OCCURRENCES"
+        ]:
+
+            try:
+
+                if pd.isna(value):
+                    occurrence_total += 1
+
+                else:
+                    occurrence_total += max(
+                        int(float(value)),
+                        1
+                    )
+
+            except (
+                ValueError,
+                TypeError
+            ):
+
+                occurrence_total += 1
+
+        # ----------------------------------------------------
+        # DIRECTORY ANALYSIS
+        # ----------------------------------------------------
 
         directory_counts = {}
 
         for file_path in file_paths:
 
             normalized_path = (
-                str(file_path)
-                .replace("\\", "/")
+                file_path
+                .replace(
+                    "\\",
+                    "/"
+                )
+                .strip("/")
             )
 
-            parts = normalized_path.split("/")
+            parts = normalized_path.split(
+                "/"
+            )
 
             if len(parts) > 1:
 
@@ -373,7 +1017,8 @@ for report_file in risk_reports:
 
         top_directories = sorted(
             directory_counts.items(),
-            key=lambda x: x[1],
+            key=lambda item:
+                item[1],
             reverse=True
         )
 
@@ -385,27 +1030,33 @@ for report_file in risk_reports:
             ]
         )
 
-        # ----------------------------------------------
-        # Remediation Scope
-        # ----------------------------------------------
+        # ----------------------------------------------------
+        # REMEDIATION SCOPE
+        # ----------------------------------------------------
 
-        if len(file_paths) > 50:
+        file_count = len(
+            file_paths
+        )
 
-            remediation_scope = "Large"
+        if file_count > 50:
 
-        elif len(file_paths) > 15:
+            scope = "Large"
 
-            remediation_scope = "Medium"
+        elif file_count > 15:
+
+            scope = "Medium"
 
         else:
 
-            remediation_scope = "Small"
+            scope = "Small"
 
-        # ----------------------------------------------
-        # Trim File List
-        # ----------------------------------------------
+        # ----------------------------------------------------
+        # AFFECTED FILES
+        # ----------------------------------------------------
 
-        display_files = file_paths[:15]
+        display_files = file_paths[
+            :15
+        ]
 
         affected_files = "\n".join(
             display_files
@@ -413,33 +1064,65 @@ for report_file in risk_reports:
 
         extra_files = max(
             0,
-            len(file_paths) - 15
+            file_count - 15
         )
 
-        if extra_files > 0:
+        if extra_files:
 
             affected_files += (
                 f"\n\n... and "
                 f"{extra_files} additional files"
             )
 
-        descriptions = (
-            group["DESCRIPTION"]
-            .dropna()
-            .astype(str)
+        # ----------------------------------------------------
+        # AFFECTED URLS
+        # ----------------------------------------------------
+
+        affected_urls = "\n".join(
+            urls[:20]
         )
 
-        actions = (
-            group["ACTION"]
-            .dropna()
-            .astype(str)
+        # ----------------------------------------------------
+        # DESCRIPTION
+        # ----------------------------------------------------
+
+        description = first_nonempty(
+            group[
+                "DESCRIPTION"
+            ]
         )
 
-        validations = (
-            group["VALIDATION"]
-            .dropna()
-            .astype(str)
+        # ----------------------------------------------------
+        # ACTION
+        # ----------------------------------------------------
+
+        action = first_nonempty(
+            group[
+                "RECOMMENDED_ACTION"
+            ]
         )
+
+        if not action:
+
+            action = first_nonempty(
+                group[
+                    "ACTION"
+                ]
+            )
+
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
+
+        validation = first_nonempty(
+            group[
+                "VALIDATION"
+            ]
+        )
+
+        # ----------------------------------------------------
+        # BUILD GROUP ROW
+        # ----------------------------------------------------
 
         grouped.append({
 
@@ -459,16 +1142,16 @@ for report_file in risk_reports:
                 cwe,
 
             "OCCURRENCES":
-                len(group),
+                occurrence_total,
 
             "FILE_COUNT":
-                len(file_paths),
+                file_count,
 
             "URL_COUNT":
                 len(urls),
 
             "REMEDIATION_SCOPE":
-                remediation_scope,
+                scope,
 
             "TOP_DIRECTORIES":
                 directory_summary,
@@ -477,30 +1160,22 @@ for report_file in risk_reports:
                 affected_files,
 
             "AFFECTED_URLS":
-                "\n".join(
-                    urls[:20]
-                ),
+                affected_urls,
 
             "DESCRIPTION":
-                descriptions.iloc[0]
-                if len(descriptions) > 0
-                else "",
+                description,
 
             "RECOMMENDED_ACTION":
-                actions.iloc[0]
-                if len(actions) > 0
-                else "",
+                action,
 
             "VALIDATION":
-                validations.iloc[0]
-                if len(validations) > 0
-                else ""
+                validation
 
         })
 
-    # --------------------------------------------------
-    # Create DataFrame
-    # --------------------------------------------------
+    # ========================================================
+    # CREATE OUTPUT DATAFRAME
+    # ========================================================
 
     output_df = pd.DataFrame(
         grouped
@@ -509,69 +1184,85 @@ for report_file in risk_reports:
     if output_df.empty:
 
         print(
-            f"{app_name}: No grouped findings."
+            f"{APP_NAME}: "
+            "No grouped findings generated."
         )
 
         continue
 
-    # --------------------------------------------------
-    # Risk Scoring
-    # --------------------------------------------------
+    # ========================================================
+    # RISK SCORING
+    # ========================================================
 
-    def calculate_score(row):
-
-        score = 0
-
-        priority = str(
-            row["PRIORITY"]
-        ).upper()
-
-        if priority == "CRITICAL":
-
-            score += 100
-
-        elif priority == "HIGH":
-
-            score += 75
-
-        elif priority == "MEDIUM":
-
-            score += 50
-
-        else:
-
-            score += 25
-
-        score += min(
-            row["OCCURRENCES"],
-            50
-        )
-
-        if (
-            str(row["SOURCE"])
-            .upper()
-            == "SNYK"
-        ):
-
-            score += 25
-
-        return score
-
-    output_df["RISK_SCORE"] = (
-        output_df.apply(
-            calculate_score,
-            axis=1
-        )
+    output_df[
+        "RISK_SCORE"
+    ] = output_df.apply(
+        calculate_risk_score,
+        axis=1
     )
+
+    # --------------------------------------------------------
+    # RISK LEVEL
+    # --------------------------------------------------------
+
+    def risk_level(score):
+
+        if score >= 125:
+            return "Critical"
+
+        if score >= 90:
+            return "High"
+
+        if score >= 60:
+            return "Medium"
+
+        return "Low"
+
+    output_df[
+        "RISK_LEVEL"
+    ] = output_df[
+        "RISK_SCORE"
+    ].apply(
+        risk_level
+    )
+
+    # ========================================================
+    # SORT
+    # ========================================================
+
+    output_df[
+        "_PRIORITY_RANK"
+    ] = output_df[
+        "PRIORITY"
+    ].map(
+        PRIORITY_RANK
+    ).fillna(99)
 
     output_df = output_df.sort_values(
-        by="RISK_SCORE",
-        ascending=False
+        by=[
+            "_PRIORITY_RANK",
+            "RISK_SCORE",
+            "OCCURRENCES",
+            "FILE_COUNT"
+        ],
+        ascending=[
+            True,
+            False,
+            False,
+            False
+        ]
     )
 
-    # --------------------------------------------------
-    # Export
-    # --------------------------------------------------
+    output_df.drop(
+        columns=[
+            "_PRIORITY_RANK"
+        ],
+        inplace=True
+    )
+
+    # ========================================================
+    # EXPORT
+    # ========================================================
 
     print(
         f"Writing: {OUTPUT_FILE}"
@@ -582,10 +1273,39 @@ for report_file in risk_reports:
         index=False
     )
 
-    # --------------------------------------------------
-    # Summary
-    # --------------------------------------------------
+    # ========================================================
+    # SUMMARY
+    # ========================================================
 
+    critical_count = len(
+        output_df[
+            output_df["PRIORITY"]
+            == "CRITICAL"
+        ]
+    )
+
+    high_count = len(
+        output_df[
+            output_df["PRIORITY"]
+            == "HIGH"
+        ]
+    )
+
+    medium_count = len(
+        output_df[
+            output_df["PRIORITY"]
+            == "MEDIUM"
+        ]
+    )
+
+    low_count = len(
+        output_df[
+            output_df["PRIORITY"]
+            == "LOW"
+        ]
+    )
+
+    print()
     print(
         f"Created: {OUTPUT_FILE}"
     )
@@ -595,25 +1315,65 @@ for report_file in risk_reports:
         f"{len(output_df)}"
     )
 
+    print(
+        f"Critical: {critical_count}"
+    )
+
+    print(
+        f"High: {high_count}"
+    )
+
+    print(
+        f"Medium: {medium_count}"
+    )
+
+    print(
+        f"Low: {low_count}"
+    )
+
     print()
+    print(
+        "Top Findings:"
+    )
+
+    display_columns = [
+        "PRIORITY",
+        "SOURCE",
+        "TITLE",
+        "CWE",
+        "FILE_COUNT",
+        "REMEDIATION_SCOPE",
+        "OCCURRENCES",
+        "RISK_SCORE",
+        "RISK_LEVEL"
+    ]
+
+    available_display_columns = [
+        column
+        for column in display_columns
+        if column in output_df.columns
+    ]
 
     print(
         output_df[
-            [
-                "PRIORITY",
-                "SOURCE",
-                "TITLE",
-                "CWE",
-                "FILE_COUNT",
-                "REMEDIATION_SCOPE",
-                "OCCURRENCES",
-                "RISK_SCORE"
-            ]
-        ]
-        .head(10)
+            available_display_columns
+        ].head(10).to_string(
+            index=False
+        )
     )
 
+    print(
+        "=" * 70
+    )
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
 print()
-print("=" * 60)
-print("Prioritization complete.")
-print("=" * 60)
+print("=" * 70)
+print(
+    "Prioritization complete."
+)
+print("=" * 70)

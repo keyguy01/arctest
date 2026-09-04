@@ -224,18 +224,62 @@ for report_file in risk_reports:
 
     ]
 
-    r7_low = (
-        (df["SOURCE"] == "Rapid7")
-        &
-        (
-            df["TITLE"]
-            .isin(LOW_VALUE_R7)
+    # --------------------------------------------------
+# Filter Low Value Rapid7 Findings
+# --------------------------------------------------
+
+    LOW_VALUE_R7 = {
+        "BROWSERCACHECHECK01",
+        "XContentTypeAttack_1",
+        "XFrameAttack_1",
+        "HSTSAttack_4",
+    }
+    
+    # Normalize SOURCE and TITLE safely
+    if "SOURCE" not in df.columns:
+        print(
+            "WARNING: SOURCE column missing. "
+            "Skipping Rapid7-specific low-value filtering."
         )
+        df["SOURCE"] = ""
+    
+    if "TITLE" not in df.columns:
+        print(
+            "ERROR: TITLE column missing. "
+            "Cannot perform finding prioritization."
+        )
+        continue
+    
+    df["SOURCE"] = (
+        df["SOURCE"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+    
+    df["TITLE"] = (
+        df["TITLE"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    
+    r7_low = (
+        df["SOURCE"].eq("RAPID7")
+        &
+        df["TITLE"].isin(LOW_VALUE_R7)
+    )
+    
+    removed_r7 = int(r7_low.sum())
+    
+    df = df.loc[~r7_low].copy()
+    
+    print(
+        f"Filtered Low-Value Rapid7 Findings: "
+        f"{removed_r7}"
     )
 
-    df = df[
-        ~r7_low
-    ]
 
     print(
         f"Remaining Findings: "
